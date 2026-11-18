@@ -10,16 +10,15 @@ Follow [Run the experiment](#run-the-experiment) to set up Docker, check the set
 
 - On Windows, start Docker Desktop with Linux containers. On Linux, start Docker Engine with the Compose plugin. The runner requires Linux containers with cgroup v2.
 - Install Python 3.10 or later. The runner uses only the standard library. Docker supplies Java 25 and Maven 3.9.16, so the experiment commands only need Docker and Python on the host.
-- Start in the project root. The following commands work in **PowerShell 7+ and Bash**.
+- Open a terminal in the cloned repository, in the directory that contains `run.py`, `compose.yaml` and `pom.xml`. Run all README commands from that directory. The following commands work in **PowerShell 7+ and Bash**.
 
 ```text
-cd experiment
 docker version
 docker compose version
 docker compose build
 ```
 
-Run the remaining commands from the `experiment` folder unless stated otherwise. If you prefer an isolated Python environment, see [Optional Python virtual environment](#optional-python-virtual-environment).
+If you prefer an isolated Python environment, see [Optional Python virtual environment](#optional-python-virtual-environment).
 
 ### 2. Check the setup with a short run
 
@@ -57,7 +56,7 @@ Open `results/pilot-expanded-01/summary.csv` and check the `status` column. For 
 
 ### 4. Run the expanded experiment
 
-You can preview the full plan with the first command in each block. The **`--dry-run`** command prints the plan without starting Docker or writing files. The second command starts the measurement campaign and writes `results/formal-expanded-01/summary.csv`.
+The expanded run collects data for the CPU, RAM and combined CPU and RAM comparisons, as well as the dataset size comparison. You can preview the full plan with the first command in each block. The **`--dry-run`** command prints the plan without starting Docker or writing files. The second command starts the measurement campaign and writes `results/formal-expanded-01/summary.csv`.
 
 **PowerShell 7+**
 
@@ -79,12 +78,12 @@ Choose a new name for each `--output` directory. For example, use `results/forma
 
 ## Find and read the results
 
-Open **`experiment/results/formal-expanded-01/summary.csv`** from the project root after running the named command above. For a pilot or smoke run, replace `formal-expanded-01` with the name you passed to `--output`. The terminal prints the full path while the run starts and again on completion.
+After the expanded run, open **`results/formal-expanded-01/summary.csv`** relative to the repository root. For a pilot or smoke run, replace `formal-expanded-01` with the name you passed to `--output`. The terminal prints the full path while the run starts and again on completion.
 
-A relative `--output` path starts from your terminal's working directory. If you omit it, the runner creates a folder under `experiment/results/` named after the mode, a UTC timestamp and a short random suffix. For example, an expanded run gets an `expanded-...` directory. The `results` folder is ignored by Git and contains the measurements on the machine where you ran the experiment.
+A relative `--output` path starts from your terminal's working directory. If you omit it, the runner creates a folder under `results/` in the repository root, named after the mode, a UTC timestamp and a short random suffix. For example, an expanded run gets an `expanded-...` directory. The `results` folder is ignored by Git and contains the measurements on the machine where you ran the experiment.
 
 ```text
-experiment/results/formal-expanded-01/
+results/formal-expanded-01/
 ├── summary.csv              Main table for Excel, one row per condition and block
 ├── runs.json                The same plan and progress as structured data
 ├── environment.json         Selected settings, software versions and Docker resources
@@ -207,27 +206,27 @@ Without overrides, `matrix` plans 24 conditions per block across 100,000, 1 mill
 
 ## Optional Python virtual environment
 
-From the project root, create the environment once and activate it when opening a new terminal.
+From the repository root, create `.venv/` once. In each new terminal, run the activation command for your shell.
 
 **PowerShell 7+**
 
 ```powershell
-py -3 -m venv .\experiment\.venv
-.\experiment\.venv\Scripts\Activate.ps1
+py -3 -m venv .\.venv
+.\.venv\Scripts\Activate.ps1
 ```
 
 **Linux/Bash**
 
 ```bash
-python3 -m venv --without-pip ./experiment/.venv
-source ./experiment/.venv/bin/activate
+python3 -m venv --without-pip ./.venv
+source ./.venv/bin/activate
 ```
 
-If you are already in `experiment`, activate it with `.\.venv\Scripts\Activate.ps1` in PowerShell or `source .venv/bin/activate` in Bash. Once activated, use `python` in place of `py -3` or `python3` in the run commands.
+Once activated, use `python` in place of `py -3` or `python3` in the run commands.
 
 ## Docker-only single comparison
 
-For a manual comparison without Python, build the image with `docker compose build` from `experiment`. Then select the resource limits and a new output directory.
+For a manual comparison without Python, build the image with `docker compose build` from the repository root. Then select the resource limits and a new output directory.
 
 **PowerShell 7+**
 
@@ -279,7 +278,7 @@ unset CPU_ALLOWANCE MEMORY_MIB HEAP_PERCENT RESULTS_DIR
 
 The JUnit Jupiter 6.1.3 tests cover workload correctness, including empty data, intervals, matching sequential and parallel results and totals larger than a 32-bit integer. They also check that sequential runs start without parallel workers. The Docker build runs the Java tests automatically.
 
-Run the Python tests for planning, feasibility checks and result validation from `experiment`.
+Run the Python tests for planning, feasibility checks and result validation from the repository root.
 
 **PowerShell 7+**
 
@@ -318,17 +317,27 @@ java -jar target/benchmarks.jar -l
 
 Use local execution for development checks. The Docker runs provide the specified resource limits and cgroup measurements. Rebuild the Docker image after changing Java sources or `entrypoint.sh`. Source hashes in `environment.json` describe the working files at invocation time. The recorded image identity describes the binary actually executed. Keep the source snapshot and image together for reproducibility, and use `--build` after edits.
 
-## Files and their purpose
+## Repository layout
 
-- `pom.xml`: pinned Java dependencies, JMH annotation processing, tests and executable JAR packaging.
-- `src/main/java/.../Workload.java` and `EventRecord.java`: synthetic input and equivalent calculations.
-- `StreamBenchmark.java`: JMH entry points, setup and correctness checks.
-- `ResourceProfiler.java` and `RunMetadata.java`: measurement-only resource collection and reproducibility metadata.
-- `Dockerfile`, `compose.yaml` and `entrypoint.sh`: repeatable build, resource allowances and separate controller/worker heaps.
-- `run.py`: Docker inspection, randomised blocks, result validation, failure preservation and CSV summary.
-- `src/test/java/.../WorkloadTest.java`, `BenchmarkIsolationTest.java` and `test_run.py`: workload correctness, fresh-JVM isolation and runner-validation tests.
-- `.dockerignore` and `.gitignore`: keep generated measurements, build output and local settings out of image contexts and source commits.
-- `.gitattributes`: preserve LF line endings for scripts and source.
+```text
+parallel-vs-sequential-research/
+├── README.md
+├── run.py             Plan and run benchmarks, validate results and write the CSV summary
+├── test_run.py        Tests for the Python runner
+├── requirements.txt   Optional virtualenv tooling
+├── pom.xml            Maven build, Java dependencies and JMH packaging
+├── Dockerfile         Build and test the Java code, then package the runtime image
+├── compose.yaml        Build settings and resource limits for manual Docker runs
+├── entrypoint.sh      Configure JVM heaps and start the benchmark
+├── src/
+│   ├── main/java/info/remzi/experiment/  Java benchmark, workload and resource measurements
+│   └── test/java/info/remzi/experiment/  Java correctness and isolation tests
+├── results/           Local benchmark outputs, created when you run the experiment
+├── target/            Local Maven output, created when you build with Maven on the host
+└── .venv/             Optional local Python virtual environment
+```
+
+`results/`, `target/` and `.venv/` are ignored by Git.
 
 ## Sources
 
