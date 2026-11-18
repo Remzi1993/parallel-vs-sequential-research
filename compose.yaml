@@ -1,0 +1,16 @@
+services:
+  benchmark:
+    build: .
+    image: java-stream-experiment:local
+    cpus: ${CPU_ALLOWANCE:-1}
+    mem_limit: ${MEMORY_MIB:-2048}m
+    memswap_limit: ${MEMORY_MIB:-2048}m
+    network_mode: none
+    environment:
+      MEMORY_MIB: ${MEMORY_MIB:-2048}
+      HEAP_PERCENT: ${HEAP_PERCENT:-60}
+    volumes:
+      - type: bind
+        source: ${RESULTS_DIR:-./results/manual}
+        target: /out
+    command: ['info.remzi.experiment.StreamBenchmark\.(sequential|parallel)$']
