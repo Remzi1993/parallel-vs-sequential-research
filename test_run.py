@@ -35,6 +35,44 @@ class RunnerTest(unittest.TestCase):
                 self.assertIsNotNone(row["cpu_ms_per_operation"])
                 self.assertIsNotNone(row["container_mean_mib"])
 
+    def test_default_launch_builds_and_discovers_resources(self):
+        engine = dict(OSType="linux", CgroupVersion="2", NCPU=8, Architecture="amd64",
+                      KernelVersion="test", MemTotal=13 * 1024 * run.MIB)
+        image = dict(Id="test-image", Architecture="amd64")
+        with patch.object(sys, "argv", ["run.py"]):
+            args = run.arguments()
+        self.assertEqual("expanded", args.mode)
+        self.assertEqual(list(run.EXPANDED_SIZES), args.sizes)
+
+        with tempfile.TemporaryDirectory() as directory:
+            args.output = Path(directory) / "measurements"
+            with (patch.object(run, "arguments", return_value=args),
+                  patch.object(run.subprocess, "run") as build,
+                  patch.object(run, "docker", side_effect=map(json.dumps, [engine, [image], {}])),
+                  patch.object(run, "discover_topology", return_value={"cpu_order": [2, 4]}) as discover,
+                  patch.object(run, "plan", return_value=[]) as plan):
+                self.assertEqual(0, run.main())
+            build.assert_called_once_with(["docker", "compose", "build"], cwd=run.ROOT, check=True)
+            discover.assert_called_once()
+            self.assertEqual("test-image", discover.call_args.args[1])
+            plan.assert_called_once_with(args, [2, 4])
+            metadata = json.loads((args.output / "environment.json").read_text(encoding="utf-8"))
+        self.assertEqual([1, 2], metadata["arguments"]["cpus"])
+        self.assertEqual([2048, 4096, 6144, 8192, 10240, 12288], metadata["arguments"]["memory"])
+
+    def test_small_engine_selects_a_ram_limit_below_capacity(self):
+        for capacity_mib, expected in [(1024, 768), (1400, 1280)]:
+            args = SimpleNamespace(mode="expanded", cpus=None, memory=None)
+            with self.subTest(capacity_mib=capacity_mib):
+                run.resolve_levels(args, [0], capacity_mib * run.MIB)
+                self.assertEqual([expected], args.memory)
+
+    def test_rejects_removed_preview_option(self):
+        with (patch.object(sys, "argv", ["run.py", "expanded", "--dry-run"]),
+              patch("sys.stderr"), self.assertRaises(SystemExit) as error):
+            run.arguments()
+        self.assertEqual(2, error.exception.code)
+
     def test_matrix_covers_every_condition_in_each_randomised_block(self):
         args = SimpleNamespace(mode="matrix", sizes=[100000, 1000000, 100000000], cpus=[1, 4],
                                memory=[2048, 6144], blocks=5, order_seed=42, heap_percent=60)
