@@ -26,7 +26,6 @@ BENCHMARK = "info.remzi.experiment.StreamBenchmark."
 MIB = 1024 * 1024
 EXPANDED_SIZES = (100, 1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
                   10_000_000, 25_000_000, 50_000_000, 75_000_000, 100_000_000)
-EXPANDED_MEMORY_MIB = (2048, 4096, 6144, 8192, 10240)
 
 
 def docker(*args, check=True):
@@ -46,9 +45,8 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def plan(args, cpu_order=None):
-    # Offline previews have no CPU IDs. Every measured condition uses the probed order.
-    masks = {count: ",".join(str(cpu) for cpu in cpu_order[:count]) if cpu_order else None
+def plan(args, cpu_order):
+    masks = {count: ",".join(str(cpu) for cpu in cpu_order[:count])
              for count in args.cpus}
     conditions = list(itertools.product(args.sizes, args.cpus, args.memory, ("sequential", "parallel")))
     rng = random.Random(args.order_seed)
@@ -287,7 +285,8 @@ def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         "Both streams run at every combination of dataset size, allowed logical CPU count and RAM limit."
     ))
-    parser.add_argument("mode", choices=["smoke", "matrix", "expanded"])
+    parser.add_argument("mode", nargs="?", default="expanded", choices=["smoke", "matrix", "expanded"],
+                        help="Run the full experiment (default), a smoke check or a custom matrix")
     parser.add_argument("--sizes", nargs="+", type=int)
     parser.add_argument("--cpu-counts", "--cpus", dest="cpus", nargs="+", type=int,
                         help="Counts of allowed logical CPUs, using nested CPU sets")
@@ -302,7 +301,6 @@ def arguments():
     parser.add_argument("--timeout", type=float, default=600, help="Seconds per container, including setup")
     parser.add_argument("--output", type=Path, help="New directory; existing directories are rejected")
     parser.add_argument("--build", action="store_true", help="Build image and run correctness tests first")
-    parser.add_argument("--dry-run", action="store_true", help="Preview only. Supply CPU counts and RAM limits for an offline plan.")
     args = parser.parse_args()
     smoke = args.mode == "smoke"
     defaults = dict(sizes=[100000] if smoke else [100000, 1000000, 100000000],
@@ -337,8 +335,14 @@ def resolve_levels(args, cpu_order, memory_bytes):
     if any(count > capacity for count in args.cpus):
         raise RuntimeError(f"Docker exposes {capacity} eligible logical CPUs; requested {args.cpus}")
     if args.memory is None:
-        defaults = EXPANDED_MEMORY_MIB if args.mode == "expanded" else (2048, 6144)
-        args.memory = [m for m in defaults if m * MIB < memory_bytes]
+        # Leave capacity for Docker itself, even when the total is an exact multiple of 2 GiB.
+        max_mib = (memory_bytes - 1) // MIB
+        if args.mode == "expanded":
+            args.memory = list(range(2048, max_mib + 1, 2048))
+        else:
+            args.memory = [m for m in (2048, 6144) if m <= max_mib]
+        if not args.memory and max_mib >= 256:
+            args.memory = [max_mib // 256 * 256]
     unsupported = [m for m in args.memory if m * MIB >= memory_bytes]
     if unsupported or not args.memory:
         raise RuntimeError(f"Docker reports {memory_bytes / (1024 * MIB):.2f} GiB RAM; "
@@ -347,13 +351,10 @@ def resolve_levels(args, cpu_order, memory_bytes):
 
 def main():
     args = arguments()
-    if args.dry_run and args.cpus is not None and args.memory is not None:
-        print(json.dumps(plan(args), indent=2))
-        return 0
     engine = json.loads(docker("info", "--format", "{{json .}}"))
     if engine["OSType"] != "linux" or str(engine["CgroupVersion"]) != "2":
         raise RuntimeError("Use Linux containers with cgroup v2 for the recorded resource controls")
-    if args.build and not args.dry_run:
+    if args.mode == "expanded" or args.build:
         subprocess.run(["docker", "compose", "build"], cwd=ROOT, check=True)
     image = json.loads(docker("image", "inspect", IMAGE))[0]
     host_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(engine["Architecture"], engine["Architecture"])
@@ -362,9 +363,6 @@ def main():
     topology = discover_topology(docker, image["Id"])
     resolve_levels(args, topology["cpu_order"], engine["MemTotal"])
     rows = plan(args, topology["cpu_order"])
-    if args.dry_run:
-        print(json.dumps(rows, indent=2))
-        return 0
     output = (args.output or ROOT / "results" / (args.mode + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                                 + "-" + uuid.uuid4().hex[:6])).resolve()
     if "," in str(output):
