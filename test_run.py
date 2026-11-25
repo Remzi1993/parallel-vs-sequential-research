@@ -1,5 +1,6 @@
 """Check the measurement plan and rejection of incomplete/mismatched benchmark data."""
 import copy
+import csv
 import json
 import os
 from pathlib import Path
@@ -8,8 +9,9 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import cpu_topology
 import run
 
 
@@ -40,7 +42,7 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(120, len(rows))
         self.assertEqual(rows, run.plan(args))
         for block in range(1, 6):
-            combinations = {(r["records"], r["cpu"], r["memory_mib"], r["implementation"])
+            combinations = {(r["records"], r["logical_cpus"], r["memory_mib"], r["implementation"])
                             for r in rows if r["block"] == block}
             self.assertEqual(24, len(combinations))
         self.assertNotEqual([(r["records"], r["implementation"]) for r in rows[:24]],
@@ -57,23 +59,30 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(expected, {(row["records"], row["logical_cpus"], row["memory_mib"],
                                      row["implementation"]) for row in rows})
 
-    def test_expanded_design_covers_the_size_sweep_and_crossed_resource_grid(self):
-        with patch.object(sys, "argv", ["run.py", "expanded"]):
-            rows = run.plan(run.arguments())
+    def test_expanded_defaults_use_nested_cpuset_masks_and_supported_memory(self):
+        with patch.object(sys, "argv", ["run.py", "expanded", "--sizes", "1000", "--blocks", "1"]):
+            args = run.arguments()
+        cpu_order = [2, 6, 4, 8]
+        run.resolve_levels(args, cpu_order, 7_958_884_352)
+        rows = run.plan(args, cpu_order)
+        self.assertEqual([1, 2, 3, 4], list(args.cpus))
+        self.assertEqual([2048, 4096, 6144], list(args.memory))
+        self.assertEqual(24, len(rows))
+        for row in rows:
+            expected = set(cpu_order[:row["logical_cpus"]])
+            self.assertEqual(expected, cpu_topology.parse_cpu_list(row["cpuset_cpus"]))
 
-        self.assertEqual(370, len(rows))
-        for block in range(1, 6):
-            block_rows = [row for row in rows if row["block"] == block]
-            self.assertEqual(74, len(block_rows))
-            self.assertEqual({"pending"}, {row["status"] for row in block_rows})
-            for implementation in ("sequential", "parallel"):
-                subset = [row for row in block_rows if row["implementation"] == implementation]
-                grid = {(row["cpu"], row["memory_mib"]) for row in subset if row["records"] == 10_000_000}
-                self.assertEqual({(cpu, memory) for cpu in (1, 2, 4, 6, 8, 10, 12, 14, 16)
-                                  for memory in (2048, 4096, 6144)}, grid)
-                sizes = {row["records"] for row in subset if row["cpu"] == 4 and row["memory_mib"] == 6144}
-                self.assertEqual({100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
-                                  10_000_000, 25_000_000, 50_000_000, 75_000_000, 100_000_000}, sizes)
+    def test_probe_orders_one_logical_cpu_per_reported_core_before_siblings(self):
+        lines = ["allowed\t2,4,6,8", "quota\tmax 100000", "siblings\t2\t2,4",
+                 "siblings\t4\t2,4", "siblings\t6\t6,8", "siblings\t8\t6,8"]
+        probe = Mock(return_value="\n".join(lines))
+        topology = cpu_topology.discover_topology(probe, "fake-image")
+        self.assertEqual([2, 6, 4, 8], topology["cpu_order"])
+        self.assertEqual([[2, 4], [6, 8]], topology["sibling_groups"])
+        probe.return_value = "\n".join(lines[:-1])
+        topology = cpu_topology.discover_topology(probe, "fake-image")
+        self.assertEqual([2, 4, 6, 8], topology["cpu_order"])
+        self.assertIsNone(topology["sibling_groups"])
 
     def test_plan_marks_heap_lower_bound_infeasible_without_timing_values(self):
         args = SimpleNamespace(mode="matrix", sizes=[100_000_000, 500_000_000], cpus=[4],
@@ -88,23 +97,73 @@ class RunnerTest(unittest.TestCase):
             self.assertIn("Record fields alone", row["error"])
             self.assertNotIn("processing_ms", row)
 
-    def test_engine_limit_errors_identify_unsupported_levels(self):
-        engine = {"NCPU": 16, "MemTotal": 7_958_884_352}
-        run.verify_engine_limits(engine, SimpleNamespace(cpus=[1, 16], memory=[2048, 4096, 6144]))
-        with self.assertRaisesRegex(RuntimeError, r"7\.41 GiB.*8192, 10240"):
-            run.verify_engine_limits(engine, SimpleNamespace(cpus=[1, 16], memory=[6144, 8192, 10240]))
-        with self.assertRaisesRegex(RuntimeError, "16 logical CPUs.*18"):
-            run.verify_engine_limits(engine, SimpleNamespace(cpus=[1, 18], memory=[2048]))
+    def test_rejects_unavailable_cpu_counts_and_ram_limits(self):
+        for flags in [["--cpus", "3"], ["--memory", "8192"]]:
+            with self.subTest(flags=flags), patch.object(sys, "argv", ["run.py", "expanded", *flags]):
+                args = run.arguments()
+                with self.assertRaises(RuntimeError):
+                    run.resolve_levels(args, [2, 6], 7_958_884_352)
+
+    def test_container_creation_passes_exact_cpu_ids_without_a_bandwidth_limit(self):
+        args = SimpleNamespace(seed=42, heap_percent=60, warmup=1, iterations=1, seconds=1)
+        row = dict(order=1, block=1, records=1000, implementation="parallel", logical_cpus=2,
+                   cpuset_cpus="2,6", memory_mib=512, status="pending")
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                run, "docker", side_effect=RuntimeError("simulated create failure")) as docker:
+            run.run_condition(row, args, Path(directory), "fake-image")
+        command = docker.call_args.args
+        self.assertEqual("create", command[0])
+        self.assertEqual("2,6", command[command.index("--cpuset-cpus") + 1])
+        self.assertNotIn("--cpus", command)
+        self.assertNotIn("--cpu-quota", command)
 
     def test_rejects_unapplied_cpu_memory_or_swap_limits(self):
-        row = dict(cpu=2, memory_mib=512)
-        config = dict(HostConfig=dict(Memory=512 * run.MIB, MemorySwap=512 * run.MIB, NanoCpus=2_000_000_000))
+        row = dict(logical_cpus=2, cpuset_cpus="4,5", memory_mib=512)
+        config = dict(HostConfig=dict(Memory=512 * run.MIB, MemorySwap=512 * run.MIB,
+                                      CpusetCpus="4-5", NanoCpus=0, CpuQuota=0))
         run.verify_limits(config, row)
-        for key in ["Memory", "MemorySwap", "NanoCpus"]:
-            bad = copy.deepcopy(config)
-            bad["HostConfig"][key] = 0
-            with self.assertRaises(ValueError):
-                run.verify_limits(bad, row)
+        for key, wrong in [("Memory", 0), ("MemorySwap", 0), ("CpusetCpus", "3-4"),
+                           ("NanoCpus", 2_000_000_000), ("CpuQuota", 200000)]:
+            with self.subTest(key=key):
+                bad = copy.deepcopy(config)
+                bad["HostConfig"][key] = wrong
+                with self.assertRaises(ValueError):
+                    run.verify_limits(bad, row)
+
+    def test_rejects_mismatched_fork_affinity_processor_count_and_cpu_quota(self):
+        row = dict(logical_cpus=2, cpuset_cpus="4,5")
+        metadata = {"cgroup.cpuset.cpus.effective": "4-5", "cgroup.cpu.max": "max 100000",
+                    "availableProcessors": "2"}
+        run.verify_fork_placement(metadata, row)
+        for key, wrong in [("cgroup.cpuset.cpus.effective", "0-1"), ("availableProcessors", "1"),
+                           ("cgroup.cpu.max", "200000 100000")]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                run.verify_fork_placement({**metadata, key: wrong}, row)
+
+    def test_comparisons_pair_identical_inputs_and_measure_adjacent_cpu_gains(self):
+        rows = []
+        for count, parallel_ms, parallel_cpu in [(1, 12, 12), (2, 6, 15), (4, 5, 18), (5, 4, 20)]:
+            for method, time_ms, cpu_ms, memory in [
+                    ("sequential", 10, 10, 100), ("parallel", parallel_ms, parallel_cpu, 108)]:
+                rows.append(dict(block=1, records=1000, logical_cpus=count, memory_mib=512,
+                                 cpuset_cpus=",".join(str(i) for i in range(count)), implementation=method,
+                                 status="ok", processing_ms=time_ms, cpu_ms_per_operation=cpu_ms,
+                                 container_mean_mib=memory, dataset_checksum="abc", expected_sum="42"))
+        rows[-1]["dataset_checksum"] = "different-input"
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            run.write_comparisons(output, rows)
+            with (output / "comparisons.csv").open(encoding="utf-8", newline="") as stream:
+                results = {int(r["logical_cpus"]): r for r in csv.DictReader(stream)}
+        pair = results[2]
+        self.assertAlmostEqual(10 / 6, float(pair["speedup"]))
+        self.assertEqual(4, float(pair["time_saved_ms"]))
+        self.assertEqual(5, float(pair["extra_cpu_ms"]))
+        self.assertEqual(8, float(pair["extra_memory_mib"]))
+        self.assertEqual(6, float(pair["marginal_time_saved_ms"]))
+        self.assertEqual(3, float(pair["marginal_cpu_ms"]))
+        self.assertEqual("", results[4]["marginal_time_saved_ms"])
+        self.assertNotIn(5, results)
 
     def test_requires_complete_matching_single_fork_results(self):
         row = dict(records=100000, implementation="sequential")
