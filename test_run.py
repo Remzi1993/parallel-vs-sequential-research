@@ -58,10 +58,10 @@ class RunnerTest(unittest.TestCase):
             plan.assert_called_once_with(args, [2, 4])
             metadata = json.loads((args.output / "environment.json").read_text(encoding="utf-8"))
         self.assertEqual([1, 2], metadata["arguments"]["cpus"])
-        self.assertEqual([2048, 4096, 6144, 8192, 10240, 12288], metadata["arguments"]["memory"])
+        self.assertEqual([gib * 1024 for gib in range(1, 13)], metadata["arguments"]["memory"])
 
     def test_small_engine_selects_a_ram_limit_below_capacity(self):
-        for capacity_mib, expected in [(1024, 768), (1400, 1280)]:
+        for capacity_mib, expected in [(768, 512), (1024, 768), (1400, 1024)]:
             args = SimpleNamespace(mode="expanded", cpus=None, memory=None)
             with self.subTest(capacity_mib=capacity_mib):
                 run.resolve_levels(args, [0], capacity_mib * run.MIB)
@@ -104,8 +104,8 @@ class RunnerTest(unittest.TestCase):
         run.resolve_levels(args, cpu_order, 7_958_884_352)
         rows = run.plan(args, cpu_order)
         self.assertEqual([1, 2, 3, 4], list(args.cpus))
-        self.assertEqual([2048, 4096, 6144], list(args.memory))
-        self.assertEqual(24, len(rows))
+        self.assertEqual([gib * 1024 for gib in range(1, 8)], list(args.memory))
+        self.assertEqual(56, len(rows))
         for row in rows:
             expected = set(cpu_order[:row["logical_cpus"]])
             self.assertEqual(expected, cpu_topology.parse_cpu_list(row["cpuset_cpus"]))
