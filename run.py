@@ -335,12 +335,9 @@ def resolve_levels(args, cpu_order, memory_bytes):
     if any(count > capacity for count in args.cpus):
         raise RuntimeError(f"Docker exposes {capacity} eligible logical CPUs; requested {args.cpus}")
     if args.memory is None:
-        # Leave capacity for Docker itself, even when the total is an exact multiple of 2 GiB.
+        # Keep each RAM limit strictly below Docker's reported capacity.
         max_mib = (memory_bytes - 1) // MIB
-        if args.mode == "expanded":
-            args.memory = list(range(2048, max_mib + 1, 2048))
-        else:
-            args.memory = [m for m in (2048, 6144) if m <= max_mib]
+        args.memory = list(range(1024, max_mib + 1, 1024))
         if not args.memory and max_mib >= 256:
             args.memory = [max_mib // 256 * 256]
     unsupported = [m for m in args.memory if m * MIB >= memory_bytes]
