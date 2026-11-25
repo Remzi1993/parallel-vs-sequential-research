@@ -76,9 +76,9 @@ class RunnerTest(unittest.TestCase):
     def test_matrix_covers_every_condition_in_each_randomised_block(self):
         args = SimpleNamespace(mode="matrix", sizes=[100000, 1000000, 100000000], cpus=[1, 4],
                                memory=[2048, 6144], blocks=5, order_seed=42, heap_percent=60)
-        rows = run.plan(args)
+        rows = run.plan(args, [0, 1, 2, 3])
         self.assertEqual(120, len(rows))
-        self.assertEqual(rows, run.plan(args))
+        self.assertEqual(rows, run.plan(args, [0, 1, 2, 3]))
         for block in range(1, 6):
             combinations = {(r["records"], r["logical_cpus"], r["memory_mib"], r["implementation"])
                             for r in rows if r["block"] == block}
@@ -90,7 +90,7 @@ class RunnerTest(unittest.TestCase):
         with patch.object(sys, "argv", ["run.py", "expanded", "--sizes", "1000", "2000",
                                        "--cpus", "1", "2", "3", "--memory", "512", "1024",
                                        "--blocks", "1"]):
-            rows = run.plan(run.arguments())
+            rows = run.plan(run.arguments(), [0, 1, 2])
         expected = {(n, cpu, ram, impl) for n in (1000, 2000) for cpu in (1, 2, 3)
                     for ram in (512, 1024) for impl in ("sequential", "parallel")}
         self.assertEqual(len(expected), len(rows))
@@ -125,7 +125,7 @@ class RunnerTest(unittest.TestCase):
     def test_plan_marks_heap_lower_bound_infeasible_without_timing_values(self):
         args = SimpleNamespace(mode="matrix", sizes=[100_000_000, 500_000_000], cpus=[4],
                                memory=[2048, 6144], blocks=1, order_seed=42, heap_percent=60)
-        rows = run.plan(args)
+        rows = run.plan(args, [0, 1, 2, 3])
         accepted = [row for row in rows if row["status"] == "pending"]
         self.assertEqual(2, len(accepted))
         self.assertTrue(all(row["records"] == 100_000_000 and row["memory_mib"] == 6144 for row in accepted))
