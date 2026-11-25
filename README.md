@@ -10,7 +10,7 @@ python3 run.py
 
 On Windows, run `py run.py`. Use `py` in place of `python3` in the examples below.
 
-The runner builds the image and detects the resources available to Docker. Processor counts increase from 1 to the detected maximum in steps of 1. The RAM limit increases in 2 GiB steps below Docker’s memory limit, with a smaller limit on low-memory machines.
+The runner builds the image and detects the resources available to Docker. Processor counts increase from 1 to the detected maximum in steps of 1. RAM limits start at 1 GiB and increase by 1 GiB while staying below Docker’s memory limit, with a smaller limit on low-memory machines.
 
 ## Research question
 
