@@ -46,6 +46,17 @@ class RunnerTest(unittest.TestCase):
         self.assertNotEqual([(r["records"], r["implementation"]) for r in rows[:24]],
                             [(r["records"], r["implementation"]) for r in rows[24:48]])
 
+    def test_expanded_pairs_both_streams_at_every_size_cpu_count_and_ram_limit(self):
+        with patch.object(sys, "argv", ["run.py", "expanded", "--sizes", "1000", "2000",
+                                       "--cpus", "1", "2", "3", "--memory", "512", "1024",
+                                       "--blocks", "1"]):
+            rows = run.plan(run.arguments())
+        expected = {(n, cpu, ram, impl) for n in (1000, 2000) for cpu in (1, 2, 3)
+                    for ram in (512, 1024) for impl in ("sequential", "parallel")}
+        self.assertEqual(len(expected), len(rows))
+        self.assertEqual(expected, {(row["records"], row["logical_cpus"], row["memory_mib"],
+                                     row["implementation"]) for row in rows})
+
     def test_expanded_design_covers_the_size_sweep_and_crossed_resource_grid(self):
         with patch.object(sys, "argv", ["run.py", "expanded"]):
             rows = run.plan(run.arguments())
