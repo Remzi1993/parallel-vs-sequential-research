@@ -238,6 +238,51 @@ def save_progress(output, rows):
         writer.writerows(rows)
 
 
+def write_comparisons(output, rows):
+    """Compare successful runs within the same randomised block."""
+    groups = {}
+    for row in rows:
+        if row["status"] == "ok":
+            key = (row["records"], row["memory_mib"], row["block"], row["logical_cpus"])
+            groups.setdefault(key, {})[row["implementation"]] = row
+
+    def same_input(first, second):
+        return (first["dataset_checksum"], first["expected_sum"]) == (
+            second["dataset_checksum"], second["expected_sum"])
+
+    def difference(first, second, metric):
+        if first is None or second is None or first.get(metric) is None or second.get(metric) is None:
+            return None
+        return first[metric] - second[metric]
+
+    fields = ["records", "memory_mib", "block", "logical_cpus", "cpuset_cpus", "sequential_ms",
+              "parallel_ms", "speedup", "time_saved_ms", "extra_cpu_ms", "extra_memory_mib",
+              "marginal_time_saved_ms", "marginal_cpu_ms"]
+    with (output / "comparisons.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for key, pair in sorted(groups.items()):
+            if "sequential" not in pair or "parallel" not in pair:
+                continue
+            seq, par = pair["sequential"], pair["parallel"]
+            if not same_input(seq, par) or seq["cpuset_cpus"] != par["cpuset_cpus"]:
+                print(f"Skipping unmatched inputs or CPU placement at {key}", file=sys.stderr)
+                continue
+            records, ram, block, count = key
+            previous = groups.get((records, ram, block, count - 1), {}).get("parallel")
+            if previous and not same_input(previous, par):
+                previous = None
+            writer.writerow(dict(
+                records=records, memory_mib=ram, block=block, logical_cpus=count,
+                cpuset_cpus=par["cpuset_cpus"], sequential_ms=seq["processing_ms"],
+                parallel_ms=par["processing_ms"], speedup=seq["processing_ms"] / par["processing_ms"],
+                time_saved_ms=seq["processing_ms"] - par["processing_ms"],
+                extra_cpu_ms=difference(par, seq, "cpu_ms_per_operation"),
+                extra_memory_mib=difference(par, seq, "container_mean_mib"),
+                marginal_time_saved_ms=difference(previous, par, "processing_ms"),
+                marginal_cpu_ms=difference(par, previous, "cpu_ms_per_operation")))
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
         "Both streams run at every combination of dataset size, allowed logical CPU count and RAM limit."
@@ -350,9 +395,11 @@ def main():
             print(f'  {row["status"]}', flush=True)
     except KeyboardInterrupt:
         save_progress(output, rows)
+        write_comparisons(output, rows)
         print("Interrupted; active container stopped and partial results preserved.", file=sys.stderr)
         return 130
-    print(f"Finished. Read {output / 'summary.csv'}", flush=True)
+    write_comparisons(output, rows)
+    print(f"Finished. Read {output / 'summary.csv'} and {output / 'comparisons.csv'}", flush=True)
     return 0 if all(row["status"] == "ok" for row in rows) else 1
 
 
