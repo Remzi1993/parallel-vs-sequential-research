@@ -2,7 +2,7 @@ services:
   benchmark:
     build: .
     image: java-stream-experiment:local
-    cpus: ${CPU_ALLOWANCE:-1}
+    cpuset: "${CPU_SET:-0}"
     mem_limit: ${MEMORY_MIB:-2048}m
     memswap_limit: ${MEMORY_MIB:-2048}m
     network_mode: none

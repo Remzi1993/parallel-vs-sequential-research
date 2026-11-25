@@ -59,7 +59,7 @@ final class RunMetadata {
         metadata.setProperty("jvmArguments", String.join(" ", ManagementFactory.getRuntimeMXBean().getInputArguments()));
         metadata.setProperty("garbageCollectors", ManagementFactory.getGarbageCollectorMXBeans().stream()
                 .map(bean -> bean.getName()).reduce((left, right) -> left + ", " + right).orElse("unavailable"));
-        for (String file : new String[]{"cpu.max", "memory.max", "memory.swap.max", "cpu.stat"}) {
+        for (String file : new String[]{"cpu.max", "cpuset.cpus.effective", "memory.max", "memory.swap.max", "cpu.stat"}) {
             metadata.setProperty("cgroup." + file, cgroupValue(file));
         }
         Path target = outputDirectory().resolve("metadata-" + ProcessHandle.current().pid() + ".properties");

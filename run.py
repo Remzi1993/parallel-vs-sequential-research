@@ -18,14 +18,15 @@ import time
 from datetime import datetime, timezone
 import uuid
 
+from cpu_topology import discover_topology, parse_cpu_list
+
 ROOT = Path(__file__).resolve().parent
 IMAGE = "java-stream-experiment:local"
 BENCHMARK = "info.remzi.experiment.StreamBenchmark."
 MIB = 1024 * 1024
-EXPANDED_SIZES = (100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
+EXPANDED_SIZES = (100, 1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
                   10_000_000, 25_000_000, 50_000_000, 75_000_000, 100_000_000)
-EXPANDED_CPUS = (1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0)
-EXPANDED_MEMORY_MIB = (2048, 4096, 6144)
+EXPANDED_MEMORY_MIB = (2048, 4096, 6144, 8192, 10240)
 
 
 def docker(*args, check=True):
@@ -45,32 +46,19 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
-def resource_conditions(args):
-    if args.mode != "expanded":
-        return itertools.product(args.sizes, args.cpus, args.memory)
-
-    # The size sweep shares one condition with the CPU/RAM grid.
-    reference_size = 10_000_000 if 10_000_000 in args.sizes else min(args.sizes)
-    reference_cpu = 4.0 if 4.0 in args.cpus else min(args.cpus)
-    reference_memory = max(args.memory)
-    return itertools.chain(
-        itertools.product([reference_size], args.cpus, args.memory),
-        ((size, reference_cpu, reference_memory) for size in args.sizes if size != reference_size),
-    )
-
-
-def plan(args):
-    conditions = [(size, cpu, memory, implementation)
-                  for size, cpu, memory in resource_conditions(args)
-                  for implementation in ("sequential", "parallel")]
+def plan(args, cpu_order=None):
+    # Offline previews have no CPU IDs. Every measured condition uses the probed order.
+    masks = {count: ",".join(str(cpu) for cpu in cpu_order[:count]) if cpu_order else None
+             for count in args.cpus}
+    conditions = list(itertools.product(args.sizes, args.cpus, args.memory, ("sequential", "parallel")))
     rng = random.Random(args.order_seed)
     rows = []
     for block in range(1, args.blocks + 1):
         order = conditions.copy()
         rng.shuffle(order)
         for size, cpu, memory, implementation in order:
-            row = dict(order=len(rows) + 1, block=block, records=size, cpu=cpu,
-                       memory_mib=memory, implementation=implementation, status="pending")
+            row = dict(order=len(rows) + 1, block=block, records=size, logical_cpus=cpu,
+                       cpuset_cpus=masks[cpu], memory_mib=memory, implementation=implementation, status="pending")
             heap_mib = memory * args.heap_percent // 100  # Matches entrypoint.sh
             field_bytes = size * 16  # Two long fields, excluding objects and list storage
             if field_bytes > heap_mib * MIB:
@@ -87,8 +75,20 @@ def verify_limits(inspect, row):
     memory = row["memory_mib"] * MIB
     if config["Memory"] != memory or config["MemorySwap"] != memory:
         raise ValueError("Docker did not apply the requested memory and no-swap limits")
-    if not math.isclose(config["NanoCpus"] / 1e9, row["cpu"], rel_tol=1e-8):
-        raise ValueError("Docker did not apply the requested CPU quota")
+    if parse_cpu_list(config["CpusetCpus"]) != parse_cpu_list(row["cpuset_cpus"]):
+        raise ValueError("Docker did not apply the requested CPU IDs")
+    if config["NanoCpus"] or config["CpuQuota"] > 0:
+        raise ValueError("Docker applied a CPU time quota to the pinned container")
+
+
+def verify_fork_placement(properties, row):
+    effective = parse_cpu_list(properties["cgroup.cpuset.cpus.effective"])
+    if effective != parse_cpu_list(row["cpuset_cpus"]):
+        raise ValueError("Benchmark observed a different effective CPU set")
+    if int(properties["availableProcessors"]) != row["logical_cpus"]:
+        raise ValueError("JVM available processor count differs from the requested CPU count")
+    if properties["cgroup.cpu.max"].split()[0] != "max":
+        raise ValueError("Benchmark observed a CPU time quota")
 
 
 def read_result(path, row, args):
@@ -142,10 +142,10 @@ def resource_summary(directory, row, args):
         raise ValueError("Benchmark did not observe the requested cgroup memory limit")
     if properties.get("cgroup.memory.swap.max") != "0":
         raise ValueError("Benchmark did not observe disabled container swap")
-    quota, period = properties["cgroup.cpu.max"].split()
-    if not math.isclose(int(quota) / int(period), row["cpu"], rel_tol=1e-5):
-        raise ValueError("Benchmark did not observe the requested cgroup CPU quota")
-    return dict(cpu_ms_per_operation=cpu,
+    verify_fork_placement(properties, row)
+    return dict(jvm_available_processors=int(properties["availableProcessors"]),
+                common_pool_parallelism=int(properties["commonPoolParallelism"]),
+                cpu_ms_per_operation=cpu,
                 container_mean_mib=statistics.mean(values) if values else None,
                 container_max_observed_mib=max(values) if values else None,
                 memory_samples=len(samples), dataset_checksum=properties["datasetChecksum"],
@@ -153,12 +153,12 @@ def resource_summary(directory, row, args):
 
 
 def run_condition(row, args, output, image_id):
-    directory = output / f'{row["order"]:03d}-block{row["block"]}-{row["implementation"]}-n{row["records"]}-c{row["cpu"]:g}-m{row["memory_mib"]}'
+    directory = output / f'{row["order"]:03d}-block{row["block"]}-{row["implementation"]}-n{row["records"]}-c{row["logical_cpus"]}-m{row["memory_mib"]}'
     directory.mkdir()
     row["directory"] = directory.name
     container_name = "java-stream-" + uuid.uuid4().hex[:12]
     command = ["create", "--name", container_name, "--network", "none",
-               "--cpus", str(row["cpu"]), "--memory", str(row["memory_mib"] * MIB),
+               "--cpuset-cpus", row["cpuset_cpus"], "--memory", str(row["memory_mib"] * MIB),
                "--memory-swap", str(row["memory_mib"] * MIB),
                "--env", f'MEMORY_MIB={row["memory_mib"]}',
                "--env", f"HEAP_PERCENT={args.heap_percent}",
@@ -227,7 +227,8 @@ def run_condition(row, args, output, image_id):
 
 def save_progress(output, rows):
     write_json(output / "runs.json", rows)
-    fields = ["order", "block", "implementation", "records", "cpu", "memory_mib", "status",
+    fields = ["order", "block", "implementation", "records", "logical_cpus", "cpuset_cpus",
+              "jvm_available_processors", "common_pool_parallelism", "memory_mib", "status",
               "processing_ms", "cpu_ms_per_operation", "container_mean_mib",
               "container_max_observed_mib", "memory_samples", "dataset_checksum", "expected_sum",
               "exit_code", "directory", "error"]
@@ -239,12 +240,12 @@ def save_progress(output, rows):
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        "expanded crosses CPU and RAM at a reference dataset size and varies dataset size "
-        "at fixed CPU and RAM. matrix crosses all selected sizes, CPU quotas and RAM limits."
+        "Both streams run at every combination of dataset size, allowed logical CPU count and RAM limit."
     ))
     parser.add_argument("mode", choices=["smoke", "matrix", "expanded"])
     parser.add_argument("--sizes", nargs="+", type=int)
-    parser.add_argument("--cpus", nargs="+", type=float)
+    parser.add_argument("--cpu-counts", "--cpus", dest="cpus", nargs="+", type=int,
+                        help="Counts of allowed logical CPUs, using nested CPU sets")
     parser.add_argument("--memory", nargs="+", type=int, help="Container limits in MiB")
     parser.add_argument("--blocks", type=int)
     parser.add_argument("--warmup", type=int)
@@ -256,61 +257,69 @@ def arguments():
     parser.add_argument("--timeout", type=float, default=600, help="Seconds per container, including setup")
     parser.add_argument("--output", type=Path, help="New directory; existing directories are rejected")
     parser.add_argument("--build", action="store_true", help="Build image and run correctness tests first")
-    parser.add_argument("--dry-run", action="store_true", help="Print plan without Docker or file writes")
+    parser.add_argument("--dry-run", action="store_true", help="Preview only. Supply CPU counts and RAM limits for an offline plan.")
     args = parser.parse_args()
     smoke = args.mode == "smoke"
     defaults = dict(sizes=[100000] if smoke else [100000, 1000000, 100000000],
-                    cpus=[1.0] if smoke else [1.0, 4.0], memory=[512] if smoke else [2048, 6144],
+                    cpus=[1] if smoke else None, memory=[512] if smoke else None,
                     blocks=1 if smoke else 5, warmup=1 if smoke else 5,
                     iterations=2 if smoke else 10, seconds=0.2 if smoke else 1.0)
     if args.mode == "expanded":
-        defaults.update(sizes=list(EXPANDED_SIZES), cpus=list(EXPANDED_CPUS),
-                        memory=list(EXPANDED_MEMORY_MIB))
+        defaults["sizes"] = list(EXPANDED_SIZES)
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
     if any(n <= 0 or n % 4 or n > 2147483647 for n in args.sizes):
         parser.error("Dataset sizes must be positive multiples of four and at most 2,147,483,647 for the Java ArrayList workload")
-    if any(not math.isfinite(c) or c <= 0 for c in args.cpus) or any(m < 256 for m in args.memory):
-        parser.error("CPU quotas must be positive and memory limits at least 256 MiB")
+    if any(c < 1 for c in (args.cpus or [])) or any(m < 256 for m in (args.memory or [])):
+        parser.error("CPU counts must be positive integers and memory limits at least 256 MiB")
     if not 10 <= args.heap_percent <= 80 or min(args.blocks, args.warmup, args.iterations) < 1:
         parser.error("Heap percentage must be 10..80; blocks and iteration counts must be positive")
     if not math.isfinite(args.seconds) or args.seconds < 0.001 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("Durations must be finite and positive; iterations must last at least 0.001 seconds")
     if not -(2**63) <= args.seed < 2**63:
         parser.error("Dataset seed must fit a Java long")
-    if any(len(values) != len(set(values)) for values in (args.sizes, args.cpus, args.memory)):
+    if any(len(values) != len(set(values)) for values in (args.sizes, args.cpus or [], args.memory or [])):
         parser.error("Do not repeat factor levels")
     return args
 
 
-def verify_engine_limits(engine, args):
-    unsupported_cpus = [f"{cpu:g}" for cpu in args.cpus if cpu > engine["NCPU"]]
-    unsupported_memory = [str(memory) for memory in args.memory if memory * MIB >= engine["MemTotal"]]
-    if unsupported_cpus:
-        raise RuntimeError(f"Docker exposes {engine['NCPU']} logical CPUs. "
-                           f"Requested CPU allowances above that limit: {', '.join(unsupported_cpus)}.")
-    if unsupported_memory:
-        raise RuntimeError(f"Docker reports {engine['MemTotal'] / (1024 * MIB):.2f} GiB of RAM. "
-                           f"Requested limits at or above that capacity (MiB): {', '.join(unsupported_memory)}.")
+def resolve_levels(args, cpu_order, memory_bytes):
+    capacity = len(cpu_order)
+    if args.cpus is None:
+        args.cpus = (list(range(1, capacity + 1)) if args.mode == "expanded"
+                     else [n for n in (1, 4) if n <= capacity])
+    if any(count > capacity for count in args.cpus):
+        raise RuntimeError(f"Docker exposes {capacity} eligible logical CPUs; requested {args.cpus}")
+    if args.memory is None:
+        defaults = EXPANDED_MEMORY_MIB if args.mode == "expanded" else (2048, 6144)
+        args.memory = [m for m in defaults if m * MIB < memory_bytes]
+    unsupported = [m for m in args.memory if m * MIB >= memory_bytes]
+    if unsupported or not args.memory:
+        raise RuntimeError(f"Docker reports {memory_bytes / (1024 * MIB):.2f} GiB RAM; "
+                           f"choose --memory limits below that capacity (MiB). Unsupported: {unsupported}")
 
 
 def main():
     args = arguments()
-    rows = plan(args)
-    if args.dry_run:
-        print(json.dumps(rows, indent=2))
+    if args.dry_run and args.cpus is not None and args.memory is not None:
+        print(json.dumps(plan(args), indent=2))
         return 0
     engine = json.loads(docker("info", "--format", "{{json .}}"))
     if engine["OSType"] != "linux" or str(engine["CgroupVersion"]) != "2":
         raise RuntimeError("Use Linux containers with cgroup v2 for the recorded resource controls")
-    verify_engine_limits(engine, args)
-    if args.build:
+    if args.build and not args.dry_run:
         subprocess.run(["docker", "compose", "build"], cwd=ROOT, check=True)
     image = json.loads(docker("image", "inspect", IMAGE))[0]
     host_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(engine["Architecture"], engine["Architecture"])
     if image["Architecture"] != host_arch:
         raise RuntimeError("Image architecture differs from Docker host; avoid emulation for measurements")
+    topology = discover_topology(docker, image["Id"])
+    resolve_levels(args, topology["cpu_order"], engine["MemTotal"])
+    rows = plan(args, topology["cpu_order"])
+    if args.dry_run:
+        print(json.dumps(rows, indent=2))
+        return 0
     output = (args.output or ROOT / "results" / (args.mode + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                                 + "-" + uuid.uuid4().hex[:6])).resolve()
     if "," in str(output):
@@ -318,10 +327,11 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     hashes = {str(p.relative_to(ROOT)).replace(os.sep, "/"): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in [ROOT / "pom.xml", ROOT / "Dockerfile", ROOT / "entrypoint.sh", ROOT / "compose.yaml",
-                        ROOT / "run.py", *sorted((ROOT / "src").rglob("*.java"))]}
+                        ROOT / "run.py", ROOT / "cpu_topology.py", *sorted((ROOT / "src").rglob("*.java"))]}
     write_json(output / "environment.json", dict(
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         captured_utc=datetime.now(timezone.utc).isoformat(), python=sys.version,
+        cpu_control="cpuset", cpu_topology=topology,
         host_platform=platform.platform(), docker_version=json.loads(docker("version", "--format", "{{json .}}")),
         docker_resources={k: engine[k] for k in ["NCPU", "MemTotal", "Architecture", "KernelVersion", "CgroupVersion"]},
         image=image, source_sha256=hashes))
@@ -331,7 +341,7 @@ def main():
     try:
         for row in rows:
             print(f'[{row["order"]}/{len(rows)}] block {row["block"]}: {row["implementation"]}, '
-                  f'{row["records"]:,} records, {row["cpu"]:g} CPU, {row["memory_mib"]} MiB', flush=True)
+                  f'{row["records"]:,} records, {row["logical_cpus"]} logical CPUs, {row["memory_mib"]} MiB', flush=True)
             if row["status"] == "infeasible":
                 print(f'  infeasible: {row["error"]}', flush=True)
                 continue
