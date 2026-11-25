@@ -8,7 +8,7 @@ Start Docker with Linux containers (cgroup v2) and open a terminal in the reposi
 python3 run.py
 ```
 
-This works in PowerShell and Bash wherever `python3` is installed. With the Windows Python launcher, use `py -3 run.py` and substitute `py -3` for `python3` in the commands below.
+On Windows, run `py run.py`. Use `py` in place of `python3` in the examples below.
 
 The runner builds the image and detects the resources available to Docker. Processor counts increase from 1 to the detected maximum in steps of 1. The RAM limit increases in 2 GiB steps below Docker’s memory limit, with a smaller limit on low-memory machines.
 
