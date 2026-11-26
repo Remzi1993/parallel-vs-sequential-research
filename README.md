@@ -18,7 +18,7 @@ When does parallel processing save enough time over sequential processing, given
 
 Both streams filter and sum the same records. At 1,000 and 1 million records, the experiment tests every processor count at every RAM limit. At 5 million records it tests every processor count at the highest RAM limit.
 
-Each setting gets two independent repetitions. The streams run back-to-back in separate JVMs on the same CPU IDs, in reverse order on the second repetition. Each JVM runs two warm-up and three measurement iterations of half a second each. With 16 logical processors and seven RAM levels, that makes 960 runs.
+Each setting gets two independent repetitions. The streams run back-to-back in separate JVMs on the same CPU IDs, in reverse order on the second repetition. Each JVM warms up for two half-second iterations, then measures the calculation for three more. JVM startup and data generation add to the total time you wait. The reported processing time covers only the filter and sum. With 16 logical processors and seven RAM levels, that makes 960 runs.
 
 ## Results
 
