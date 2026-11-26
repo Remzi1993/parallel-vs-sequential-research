@@ -4,6 +4,7 @@
 import argparse
 import csv
 import hashlib
+from functools import partial
 import itertools
 import json
 import math
@@ -28,16 +29,35 @@ EXPANDED_SIZES = (100, 1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_50
                   10_000_000, 25_000_000, 50_000_000, 75_000_000, 100_000_000)
 
 
-def docker(*args, check=True):
+CAMPAIGN_SECONDS = 2 * 60 * 60
+CLEANUP_RESERVE_SECONDS = 30
+
+
+class CampaignTimeout(RuntimeError):
+    """The standard experiment used its wall-clock budget."""
+
+
+def remaining_seconds(deadline, maximum=None):
+    if deadline is None:
+        return maximum
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise CampaignTimeout("Two-hour experiment budget reached")
+    return left if maximum is None else min(left, maximum)
+
+
+def docker(*args, check=True, deadline=None, timeout=30, combined=False):
     try:
         result = subprocess.run(["docker", *args], cwd=ROOT, text=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT if combined else subprocess.PIPE,
+                                timeout=remaining_seconds(deadline, timeout))
     except subprocess.TimeoutExpired as error:
+        remaining_seconds(deadline)
         if check:
-            raise RuntimeError("Docker did not respond within 30 seconds") from error
+            raise RuntimeError(f"Docker did not respond within {timeout} seconds") from error
         return ""
     if check and result.returncode:
-        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+        raise RuntimeError((result.stderr or result.stdout).strip())
     return result.stdout.strip()
 
 
@@ -150,7 +170,7 @@ def resource_summary(directory, row, args):
                 expected_sum=properties["expectedSum"])
 
 
-def run_condition(row, args, output, image_id):
+def run_condition(row, args, output, image_id, deadline=None):
     directory = output / f'{row["order"]:03d}-block{row["block"]}-{row["implementation"]}-n{row["records"]}-c{row["logical_cpus"]}-m{row["memory_mib"]}'
     directory.mkdir()
     row["directory"] = directory.name
@@ -167,27 +187,28 @@ def run_condition(row, args, output, image_id):
                "-w", f"{round(args.seconds * 1000)}ms", "-r", f"{round(args.seconds * 1000)}ms"]
     write_json(directory / "condition.json", dict(row, command=["docker", *command]))
     container = None
-    interrupted = False
+    command_docker = partial(docker, deadline=deadline)
+    finished = False
     try:
-        container = docker(*command)
-        before = json.loads(docker("inspect", container))[0]
+        container = command_docker(*command)
+        before = json.loads(command_docker("inspect", container))[0]
         write_json(directory / "container-before.json", before)
         verify_limits(before, row)
-        docker("start", container)
-        deadline = time.monotonic() + args.timeout
+        command_docker("start", container)
+        condition_deadline = time.monotonic() + args.timeout
         while True:
-            state = json.loads(docker("inspect", "--format", "{{json .State}}", container))
+            state = json.loads(command_docker("inspect", "--format", "{{json .State}}", container))
             if not state["Running"]:
                 break
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= condition_deadline:
                 row["status"] = "timeout"
-                docker("stop", "--time", "1", container)
+                command_docker("stop", "--time", "1", container)
                 break
             time.sleep(0.5)
-        state = json.loads(docker("inspect", "--format", "{{json .State}}", container))
+        state = json.loads(command_docker("inspect", "--format", "{{json .State}}", container))
         row["exit_code"] = state["ExitCode"]
-        logs = subprocess.run(["docker", "logs", container], text=True, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT).stdout
+        finished = not state["Running"]
+        logs = command_docker("logs", container, combined=True)
         (directory / "console.log").write_text(logs, encoding="utf-8")
         if row["status"] == "timeout":
             return
@@ -200,27 +221,31 @@ def run_condition(row, args, output, image_id):
             resources = resource_summary(directory, row, args)
             row.update(processing_ms=processing_ms, **resources)
             row["status"] = "ok"
+    except CampaignTimeout:
+        row["status"] = "budget_exhausted"
+        # A cancelled docker create may have created the named container before returning its ID.
+        container = container or container_name
+        raise
     except KeyboardInterrupt:
         row["status"] = "interrupted"
-        interrupted = True
+        container = container or container_name
+        raise
     except (RuntimeError, ValueError, OSError, KeyError, IndexError) as error:
         row["status"] = "failed"
         row["error"] = str(error)
     finally:
         if container:
-            # Only this invocation's uniquely named container is affected.
-            docker("stop", "--time", "1", container, check=False)
-            after = docker("inspect", container, check=False)
+            # These calls use the reserved cleanup time even after the run deadline.
+            if not finished:
+                docker("stop", "--time", "1", container, check=False, timeout=5)
+            after = docker("inspect", container, check=False, timeout=5)
             if after:
                 (directory / "container-after.json").write_text(after + "\n", encoding="utf-8")
             if not (directory / "console.log").exists():
-                logs = subprocess.run(["docker", "logs", container], text=True, stdout=subprocess.PIPE,
-                                      stderr=subprocess.STDOUT).stdout
+                logs = docker("logs", container, check=False, timeout=5, combined=True)
                 (directory / "console.log").write_text(logs, encoding="utf-8")
-            docker("rm", container, check=False)
+            docker("rm", "--force", container, check=False, timeout=5)
         write_json(directory / "status.json", row)
-    if interrupted:
-        raise KeyboardInterrupt
 
 
 def save_progress(output, rows):
@@ -347,23 +372,39 @@ def resolve_levels(args, cpu_order, memory_bytes):
 
 
 def main():
+    started = time.monotonic()
     args = arguments()
-    engine = json.loads(docker("info", "--format", "{{json .}}"))
+    deadline = started + CAMPAIGN_SECONDS - CLEANUP_RESERVE_SECONDS if args.mode == "expanded" else None
+    try:
+        return run_campaign(args, deadline)
+    except CampaignTimeout as error:
+        print(f"{error} during setup; no measurements started.", file=sys.stderr)
+        return 1
+
+
+def run_campaign(args, deadline):
+    setup_docker = partial(docker, deadline=deadline)
+    engine = json.loads(setup_docker("info", "--format", "{{json .}}"))
     if engine["OSType"] != "linux" or str(engine["CgroupVersion"]) != "2":
         raise RuntimeError("Use Linux containers with cgroup v2 for the recorded resource controls")
     if args.mode == "expanded" or args.build:
-        subprocess.run(["docker", "compose", "build"], cwd=ROOT, check=True)
-    image = json.loads(docker("image", "inspect", IMAGE))[0]
+        try:
+            subprocess.run(["docker", "compose", "build"], cwd=ROOT, check=True,
+                           timeout=remaining_seconds(deadline))
+        except subprocess.TimeoutExpired as error:
+            raise CampaignTimeout("Two-hour experiment budget reached") from error
+    image = json.loads(setup_docker("image", "inspect", IMAGE))[0]
     host_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(engine["Architecture"], engine["Architecture"])
     if image["Architecture"] != host_arch:
         raise RuntimeError("Image architecture differs from Docker host; avoid emulation for measurements")
-    topology = discover_topology(docker, image["Id"])
+    topology = discover_topology(setup_docker, image["Id"])
     resolve_levels(args, topology["cpu_order"], engine["MemTotal"])
     rows = plan(args, topology["cpu_order"])
     output = (args.output or ROOT / "results" / (args.mode + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                                 + "-" + uuid.uuid4().hex[:6])).resolve()
     if "," in str(output):
         raise RuntimeError("Choose an output path without commas; Docker's mount syntax uses commas as separators")
+    docker_version = json.loads(setup_docker("version", "--format", "{{json .}}"))
     output.mkdir(parents=True, exist_ok=False)
     hashes = {str(p.relative_to(ROOT)).replace(os.sep, "/"): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in [ROOT / "pom.xml", ROOT / "Dockerfile", ROOT / "entrypoint.sh", ROOT / "compose.yaml",
@@ -372,7 +413,8 @@ def main():
         arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         captured_utc=datetime.now(timezone.utc).isoformat(), python=sys.version,
         cpu_control="cpuset", cpu_topology=topology,
-        host_platform=platform.platform(), docker_version=json.loads(docker("version", "--format", "{{json .}}")),
+        host_platform=platform.platform(), docker_version=docker_version,
+        campaign_budget_seconds=CAMPAIGN_SECONDS if deadline is not None else None,
         docker_resources={k: engine[k] for k in ["NCPU", "MemTotal", "Architecture", "KernelVersion", "CgroupVersion"]},
         image=image, source_sha256=hashes))
     save_progress(output, rows)
@@ -380,22 +422,35 @@ def main():
     print(f"Running {runnable} of {len(rows)} planned conditions in fresh JVMs. Results: {output}", flush=True)
     try:
         for row in rows:
+            remaining_seconds(deadline)
             print(f'[{row["order"]}/{len(rows)}] block {row["block"]}: {row["implementation"]}, '
                   f'{row["records"]:,} records, {row["logical_cpus"]} logical CPUs, {row["memory_mib"]} MiB', flush=True)
             if row["status"] == "infeasible":
                 print(f'  infeasible: {row["error"]}', flush=True)
                 continue
-            run_condition(row, args, output, image["Id"])
+            run_condition(row, args, output, image["Id"], deadline=deadline)
             save_progress(output, rows)
             print(f'  {row["status"]}', flush=True)
+    except CampaignTimeout:
+        for row in rows:
+            if row["status"] == "pending":
+                row["status"] = "not_run_budget"
+        save_progress(output, rows)
+        write_comparisons(output, rows)
+        completed = sum(row["status"] == "ok" for row in rows)
+        print(f"Time budget reached. {completed}/{len(rows)} valid measurements. "
+              f"Partial results: {output}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         save_progress(output, rows)
         write_comparisons(output, rows)
         print("Interrupted; active container stopped and partial results preserved.", file=sys.stderr)
         return 130
     write_comparisons(output, rows)
-    print(f"Finished. Read {output / 'summary.csv'} and {output / 'comparisons.csv'}", flush=True)
-    return 0 if all(row["status"] == "ok" for row in rows) else 1
+    completed = sum(row["status"] == "ok" for row in rows)
+    print(f"Finished with {completed}/{len(rows)} valid measurements. "
+          f"Read {output / 'summary.csv'} and {output / 'comparisons.csv'}", flush=True)
+    return 0 if completed == len(rows) else 1
 
 
 if __name__ == "__main__":
