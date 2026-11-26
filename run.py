@@ -25,10 +25,7 @@ ROOT = Path(__file__).resolve().parent
 IMAGE = "java-stream-experiment:local"
 BENCHMARK = "info.remzi.experiment.StreamBenchmark."
 MIB = 1024 * 1024
-EXPANDED_SIZES = (100, 1_000, 10_000, 100_000, 250_000, 500_000, 1_000_000, 2_500_000, 5_000_000,
-                  10_000_000, 25_000_000, 50_000_000, 75_000_000, 100_000_000)
-
-
+EXPANDED_SIZES = (1_000, 1_000_000, 5_000_000)
 CAMPAIGN_SECONDS = 2 * 60 * 60
 CLEANUP_RESERVE_SECONDS = 30
 
@@ -65,15 +62,40 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
+def block_orders(args):
+    rng = random.Random(args.order_seed)
+    streams = ("sequential", "parallel")
+    if args.mode != "expanded":
+        conditions = list(itertools.product(args.sizes, args.cpus, args.memory, streams))
+        for _ in range(args.blocks):
+            order = conditions.copy()
+            rng.shuffle(order)
+            yield order
+        return
+
+    # Cross the two smaller sizes with every RAM level. Larger inputs extend the CPU curve.
+    full_grid_sizes = sorted(args.sizes)[:2]
+    settings = [(size, cpu, ram) for size in args.sizes for cpu in args.cpus
+                for ram in (args.memory if size in full_grid_sizes else [max(args.memory)])]
+    parallel_first = {setting: rng.randrange(2) for setting in settings}
+    for block in range(args.blocks):
+        order = settings.copy()
+        rng.shuffle(order)
+        if block == 0:
+            # Finish one complete resource grid early, even on a slower machine.
+            order.sort(key=lambda setting: setting[0] != full_grid_sizes[-1])
+        pairs = []
+        for setting in order:
+            methods = streams[::-1] if (parallel_first[setting] + block) % 2 else streams
+            pairs.extend((*setting, method) for method in methods)
+        yield pairs
+
+
 def plan(args, cpu_order):
     masks = {count: ",".join(str(cpu) for cpu in cpu_order[:count])
              for count in args.cpus}
-    conditions = list(itertools.product(args.sizes, args.cpus, args.memory, ("sequential", "parallel")))
-    rng = random.Random(args.order_seed)
     rows = []
-    for block in range(1, args.blocks + 1):
-        order = conditions.copy()
-        rng.shuffle(order)
+    for block, order in enumerate(block_orders(args), start=1):
         for size, cpu, memory, implementation in order:
             row = dict(order=len(rows) + 1, block=block, records=size, logical_cpus=cpu,
                        cpuset_cpus=masks[cpu], memory_mib=memory, implementation=implementation, status="pending")
@@ -308,10 +330,11 @@ def write_comparisons(output, rows):
 
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__, epilog=(
-        "Both streams run at every combination of dataset size, allowed logical CPU count and RAM limit."
+        "The default pairs both streams across all CPU and RAM levels at two dataset sizes. "
+        "Use matrix for a full crossing at every selected size."
     ))
     parser.add_argument("mode", nargs="?", default="expanded", choices=["smoke", "matrix", "expanded"],
-                        help="Run the full experiment (default), a smoke check or a custom matrix")
+                        help="Run the two-hour experiment (default), a smoke check or a custom matrix")
     parser.add_argument("--sizes", nargs="+", type=int)
     parser.add_argument("--cpu-counts", "--cpus", dest="cpus", nargs="+", type=int,
                         help="Counts of allowed logical CPUs, using nested CPU sets")
@@ -333,7 +356,7 @@ def arguments():
                     blocks=1 if smoke else 5, warmup=1 if smoke else 5,
                     iterations=2 if smoke else 10, seconds=0.2 if smoke else 1.0)
     if args.mode == "expanded":
-        defaults["sizes"] = list(EXPANDED_SIZES)
+        defaults.update(sizes=list(EXPANDED_SIZES), blocks=2, warmup=2, iterations=3, seconds=0.5)
     for key, value in defaults.items():
         if getattr(args, key) is None:
             setattr(args, key, value)
