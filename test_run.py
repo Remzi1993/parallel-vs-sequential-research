@@ -60,6 +60,28 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual([1, 2], metadata["arguments"]["cpus"])
         self.assertEqual([gib * 1024 for gib in range(1, 13)], metadata["arguments"]["memory"])
 
+    def test_default_plan_covers_all_levels_within_compact_run_count(self):
+        with patch.object(sys, "argv", ["run.py"]):
+            args = run.arguments()
+        cpu_ids = list(range(16))
+        run.resolve_levels(args, cpu_ids, 7_958_884_352)
+        rows = run.plan(args, cpu_ids)
+        self.assertEqual(960, len(rows))
+        self.assertEqual((2, 2, 3, 0.5), (args.blocks, args.warmup, args.iterations, args.seconds))
+        expected = {(size, cpu, ram) for size in (1_000, 1_000_000) for cpu in args.cpus
+                    for ram in args.memory}
+        expected.update((5_000_000, cpu, max(args.memory)) for cpu in args.cpus)
+        for block in (1, 2):
+            pairs = [row for row in rows if row["block"] == block]
+            seen = set()
+            for first, second in zip(pairs[::2], pairs[1::2]):
+                setting = (first["records"], first["logical_cpus"], first["memory_mib"])
+                self.assertEqual(setting, (second["records"], second["logical_cpus"], second["memory_mib"]))
+                self.assertEqual({"sequential", "parallel"}, {first["implementation"], second["implementation"]})
+                seen.add(setting)
+            self.assertEqual(expected, seen)
+        self.assertTrue(all(row["records"] == 1_000_000 for row in rows[:224]))
+
     def test_small_engine_selects_a_ram_limit_below_capacity(self):
         for capacity_mib, expected in [(768, 512), (1024, 768), (1400, 1024)]:
             args = SimpleNamespace(mode="expanded", cpus=None, memory=None)
