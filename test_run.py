@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import cpu_topology
 import run
@@ -52,7 +52,9 @@ class RunnerTest(unittest.TestCase):
                   patch.object(run, "discover_topology", return_value={"cpu_order": [2, 4]}) as discover,
                   patch.object(run, "plan", return_value=[]) as plan):
                 self.assertEqual(0, run.main())
-            build.assert_called_once_with(["docker", "compose", "build"], cwd=run.ROOT, check=True)
+            build.assert_called_once_with(["docker", "compose", "build"], cwd=run.ROOT, check=True, timeout=ANY)
+            self.assertGreater(build.call_args.kwargs["timeout"], 0)
+            self.assertLessEqual(build.call_args.kwargs["timeout"], 7200)
             discover.assert_called_once()
             self.assertEqual("test-image", discover.call_args.args[1])
             plan.assert_called_once_with(args, [2, 4])
@@ -81,6 +83,50 @@ class RunnerTest(unittest.TestCase):
                 seen.add(setting)
             self.assertEqual(expected, seen)
         self.assertTrue(all(row["records"] == 1_000_000 for row in rows[:224]))
+
+    def test_elapsed_deadline_preserves_completed_pair_and_stops_new_runs(self):
+        engine = dict(OSType="linux", CgroupVersion="2", NCPU=1, Architecture="amd64",
+                      KernelVersion="test", MemTotal=2 * 1024 * run.MIB)
+        image = dict(Id="test-image", Architecture="amd64")
+        clock = Mock(return_value=0)
+
+        def finish_condition(row, args, output, image_id, deadline):
+            row.update(status="ok", processing_ms=2.0, dataset_checksum="test", expected_sum="10")
+            if row["order"] == 2:
+                clock.return_value = deadline
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "measurements"
+            argv = ["run.py", "--output", str(output), "--sizes", "1000", "--blocks", "2"]
+            with (patch.object(sys, "argv", argv), patch.object(run.time, "monotonic", clock),
+                  patch.object(run.subprocess, "run"),
+                  patch.object(run, "docker", side_effect=map(json.dumps, [engine, [image], {}])),
+                  patch.object(run, "discover_topology", return_value={"cpu_order": [0]}),
+                  patch.object(run, "run_condition", side_effect=finish_condition) as measure):
+                self.assertEqual(1, run.main())
+            self.assertEqual(2, measure.call_count)
+            rows = json.loads((output / "runs.json").read_text(encoding="utf-8"))
+            self.assertEqual(["ok", "ok", "not_run_budget", "not_run_budget"], [r["status"] for r in rows])
+            with (output / "comparisons.csv").open(encoding="utf-8", newline="") as stream:
+                comparison, = csv.DictReader(stream)
+            self.assertEqual("1", comparison["block"])
+            self.assertEqual(1.0, float(comparison["speedup"]))
+
+    def test_deadline_removes_the_active_container_and_marks_the_partial_run(self):
+        row = dict(order=1, block=1, records=1000, implementation="parallel", logical_cpus=1,
+                   cpuset_cpus="0", memory_mib=512, status="pending")
+        args = SimpleNamespace(seed=42, heap_percent=60, warmup=2, iterations=3, seconds=0.5, timeout=600)
+        config = dict(Memory=512 * run.MIB, MemorySwap=512 * run.MIB, CpusetCpus="0", NanoCpus=0, CpuQuota=0)
+        replies = ["container-id", json.dumps([{"HostConfig": config}]), "", run.CampaignTimeout("expired"),
+                   "", "", "", ""]
+        with tempfile.TemporaryDirectory() as directory, patch.object(run, "docker", side_effect=replies) as docker:
+            with self.assertRaises(run.CampaignTimeout):
+                run.run_condition(row, args, Path(directory), "fake-image", deadline=60)
+            saved = json.loads((Path(directory) / row["directory"] / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual("budget_exhausted", saved["status"])
+        self.assertNotIn("processing_ms", saved)
+        self.assertEqual(("rm", "--force", "container-id"), docker.call_args.args)
+        self.assertLessEqual(docker.call_args.kwargs["timeout"], run.CLEANUP_RESERVE_SECONDS)
 
     def test_small_engine_selects_a_ram_limit_below_capacity(self):
         for capacity_mib, expected in [(768, 512), (1024, 768), (1400, 1024)]:
