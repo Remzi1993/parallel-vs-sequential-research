@@ -60,7 +60,7 @@ class RunnerTest(unittest.TestCase):
             plan.assert_called_once_with(args, [2, 4])
             metadata = json.loads((args.output / "environment.json").read_text(encoding="utf-8"))
         self.assertEqual([1, 2], metadata["arguments"]["cpus"])
-        self.assertEqual([gib * 1024 for gib in range(1, 13)], metadata["arguments"]["memory"])
+        self.assertEqual([gib * 1024 for gib in range(2, 13, 2)], metadata["arguments"]["memory"])
 
     def test_default_plan_covers_all_levels_within_compact_run_count(self):
         with patch.object(sys, "argv", ["run.py"]):
@@ -68,11 +68,12 @@ class RunnerTest(unittest.TestCase):
         cpu_ids = list(range(16))
         run.resolve_levels(args, cpu_ids, 7_958_884_352)
         rows = run.plan(args, cpu_ids)
-        self.assertEqual(960, len(rows))
+        self.assertEqual(640, len(rows))
         self.assertEqual((2, 2, 3, 0.5), (args.blocks, args.warmup, args.iterations, args.seconds))
         expected = {(size, cpu, ram) for size in (1_000, 1_000_000) for cpu in args.cpus
                     for ram in args.memory}
-        expected.update((5_000_000, cpu, max(args.memory)) for cpu in args.cpus)
+        expected.update((size, cpu, max(args.memory)) for size in (100_000, 5_000_000, 10_000_000, 25_000_000)
+                        for cpu in args.cpus)
         for block in (1, 2):
             pairs = [row for row in rows if row["block"] == block]
             seen = set()
@@ -82,7 +83,7 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual({"sequential", "parallel"}, {first["implementation"], second["implementation"]})
                 seen.add(setting)
             self.assertEqual(expected, seen)
-        self.assertTrue(all(row["records"] == 1_000_000 for row in rows[:224]))
+        self.assertTrue(all(row["records"] == 1_000_000 for row in rows[:96]))
 
     def test_elapsed_deadline_preserves_completed_pair_and_stops_new_runs(self):
         engine = dict(OSType="linux", CgroupVersion="2", NCPU=1, Architecture="amd64",
@@ -129,7 +130,7 @@ class RunnerTest(unittest.TestCase):
         self.assertLessEqual(docker.call_args.kwargs["timeout"], run.CLEANUP_RESERVE_SECONDS)
 
     def test_small_engine_selects_a_ram_limit_below_capacity(self):
-        for capacity_mib, expected in [(768, 512), (1024, 768), (1400, 1024)]:
+        for capacity_mib, expected in [(768, 512), (1024, 768), (1400, 1280), (2048, 1792), (2049, 2048)]:
             args = SimpleNamespace(mode="expanded", cpus=None, memory=None)
             with self.subTest(capacity_mib=capacity_mib):
                 run.resolve_levels(args, [0], capacity_mib * run.MIB)
@@ -172,8 +173,8 @@ class RunnerTest(unittest.TestCase):
         run.resolve_levels(args, cpu_order, 7_958_884_352)
         rows = run.plan(args, cpu_order)
         self.assertEqual([1, 2, 3, 4], list(args.cpus))
-        self.assertEqual([gib * 1024 for gib in range(1, 8)], list(args.memory))
-        self.assertEqual(56, len(rows))
+        self.assertEqual([2048, 4096, 6144], args.memory)
+        self.assertEqual(24, len(rows))
         for row in rows:
             expected = set(cpu_order[:row["logical_cpus"]])
             self.assertEqual(expected, cpu_topology.parse_cpu_list(row["cpuset_cpus"]))
