@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parent
 IMAGE = "java-stream-experiment:local"
 BENCHMARK = "info.remzi.experiment.StreamBenchmark."
 MIB = 1024 * 1024
-EXPANDED_SIZES = (1_000, 100_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000)
+LARGE_SIZES = (50_000_000, 75_000_000, 100_000_000)
+EXPANDED_SIZES = (1_000, 100_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000) + LARGE_SIZES
 CAMPAIGN_SECONDS = 2 * 60 * 60
 CLEANUP_RESERVE_SECONDS = 30
 
@@ -74,16 +75,21 @@ def block_orders(args):
         return
 
     # Compare RAM at the smallest size and at one million records when available.
-    full_grid_sizes = sorted(args.sizes)[:2]
-    if full_grid_sizes[0] < 1_000_000 and 1_000_000 in args.sizes:
+    regular_sizes = sorted(size for size in args.sizes if size not in LARGE_SIZES)
+    full_grid_sizes = regular_sizes[:2]
+    if 1_000_000 in regular_sizes[1:]:
         full_grid_sizes[-1] = 1_000_000
-    settings = [(size, cpu, ram) for size in args.sizes for cpu in args.cpus
+    settings = [(size, cpu, ram) for size in regular_sizes for cpu in args.cpus
                 for ram in (args.memory if size in full_grid_sizes else [max(args.memory)])]
+    cpu_counts = sorted(args.cpus)
+    large_cpus = sorted({cpu_counts[0], cpu_counts[(len(cpu_counts) - 1) // 2], cpu_counts[-1]})
+    large_ram = min(args.memory, key=lambda mib: (abs(mib - 6144), mib))
+    settings.extend((size, cpu, large_ram) for size in args.sizes if size in LARGE_SIZES for cpu in large_cpus)
     parallel_first = {setting: rng.randrange(2) for setting in settings}
     for block in range(args.blocks):
         order = settings.copy()
         rng.shuffle(order)
-        if block == 0:
+        if block == 0 and full_grid_sizes:
             # Finish one complete resource grid early, even on a slower machine.
             order.sort(key=lambda setting: setting[0] != full_grid_sizes[-1])
         pairs = []
