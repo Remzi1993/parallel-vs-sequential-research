@@ -68,12 +68,14 @@ class RunnerTest(unittest.TestCase):
         cpu_ids = list(range(16))
         run.resolve_levels(args, cpu_ids, 7_958_884_352)
         rows = run.plan(args, cpu_ids)
-        self.assertEqual(640, len(rows))
+        self.assertEqual(676, len(rows))
         self.assertEqual((2, 2, 3, 0.5), (args.blocks, args.warmup, args.iterations, args.seconds))
         expected = {(size, cpu, ram) for size in (1_000, 1_000_000) for cpu in args.cpus
                     for ram in args.memory}
         expected.update((size, cpu, max(args.memory)) for size in (100_000, 5_000_000, 10_000_000, 25_000_000)
                         for cpu in args.cpus)
+        expected.update((size, cpu, 6144) for size in (50_000_000, 75_000_000, 100_000_000)
+                        for cpu in (1, 8, 16))
         for block in (1, 2):
             pairs = [row for row in rows if row["block"] == block]
             seen = set()
@@ -84,6 +86,21 @@ class RunnerTest(unittest.TestCase):
                 seen.add(setting)
             self.assertEqual(expected, seen)
         self.assertTrue(all(row["records"] == 1_000_000 for row in rows[:96]))
+
+    def test_large_sizes_use_selected_cpu_counts_and_ram_closest_to_six_gib(self):
+        cases = [
+            ([1], [2048], [1], 2048),
+            ([1, 2], [2048, 4096], [1, 2], 4096),
+            ([12, 1, 9, 3, 6], [8192, 6144, 4096], [1, 6, 12], 6144),
+        ]
+        for cpus, memory, expected_cpus, expected_ram in cases:
+            with self.subTest(cpus=cpus, memory=memory):
+                args = SimpleNamespace(mode="expanded", sizes=[100_000_000], cpus=cpus, memory=memory,
+                                       blocks=1, order_seed=42)
+                block, = run.block_orders(args)
+                expected = [(100_000_000, cpu, expected_ram, stream) for cpu in expected_cpus
+                            for stream in ("sequential", "parallel")]
+                self.assertCountEqual(expected, block)
 
     def test_elapsed_deadline_preserves_completed_pair_and_stops_new_runs(self):
         engine = dict(OSType="linux", CgroupVersion="2", NCPU=1, Architecture="amd64",
