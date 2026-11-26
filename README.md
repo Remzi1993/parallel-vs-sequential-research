@@ -16,13 +16,23 @@ The runner builds the image and tests every logical processor count from 1 to Do
 
 When does parallel processing save enough time over sequential processing, given the record count, available logical processors and RAM?
 
-Both streams filter and sum the same records. At **1,000 and 1 million records**, the experiment tests every processor count at every RAM limit. At **100,000, 5 million, 10 million and 25 million records**, it tests every processor count at the highest selected RAM limit.
+Both streams filter and sum the same records.
 
-Each setting gets two independent repetitions. The streams run back-to-back in separate JVMs on the same CPU IDs, in reverse order on the second repetition. Each JVM warms up for two half-second iterations, then measures the calculation for three more. JVM startup and data generation add to the total time you wait. The reported processing time covers only the filter and sum. With 16 logical processors and RAM limits of 2, 4 and 6 GiB, the runner schedules 640 runs.
+| Records | Logical processor counts | RAM limits |
+| --- | --- | --- |
+| 1,000 and 1 million | Every count | Every limit |
+| 100,000, 5 million, 10 million and 25 million | Every count | Highest selected limit |
+| 50 million, 75 million and 100 million | Lowest, middle and highest selected counts | 6 GiB, or the closest selected limit |
+
+With 16 logical processors, the three largest datasets run at 1, 8 and 16 processors. The runner uses the lower middle count when there are two middle counts.
+
+Each setting gets two independent repetitions. The streams run back-to-back in separate JVMs on the same CPU IDs, in reverse order on the second repetition. Each JVM warms up for two half-second iterations, then measures the calculation for three more. JVM startup and data generation add to the total time you wait. The reported processing time covers only the filter and sum. With 16 logical processors and RAM limits of 2, 4 and 6 GiB, the runner schedules 676 runs, including 36 for the three largest datasets.
 
 ## Results
 
 Each run creates a new folder under `results/`. Open `comparisons.csv` to see how much time parallel processing saved, its CPU and memory cost, and the gain from adding one more processor. `summary.csv` contains individual measurements and statuses. `environment.json` and `runs.json` record the setup and run order.
+
+To see what going from 8 to 16 processors gained, compare `parallel_ms` for those two rows in `comparisons.csv` at the same record count, RAM limit and repetition (`block`). Lower is faster.
 
 ## Options and tests
 
