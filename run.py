@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parent
 IMAGE = "java-stream-experiment:local"
 BENCHMARK = "info.remzi.experiment.StreamBenchmark."
 MIB = 1024 * 1024
-EXPANDED_SIZES = (1_000, 1_000_000, 5_000_000)
+EXPANDED_SIZES = (1_000, 100_000, 1_000_000, 5_000_000, 10_000_000, 25_000_000)
 CAMPAIGN_SECONDS = 2 * 60 * 60
 CLEANUP_RESERVE_SECONDS = 30
 
@@ -73,8 +73,10 @@ def block_orders(args):
             yield order
         return
 
-    # Cross the two smaller sizes with every RAM level. Larger inputs extend the CPU curve.
+    # Compare RAM at the smallest size and at one million records when available.
     full_grid_sizes = sorted(args.sizes)[:2]
+    if full_grid_sizes[0] < 1_000_000 and 1_000_000 in args.sizes:
+        full_grid_sizes[-1] = 1_000_000
     settings = [(size, cpu, ram) for size in args.sizes for cpu in args.cpus
                 for ram in (args.memory if size in full_grid_sizes else [max(args.memory)])]
     parallel_first = {setting: rng.randrange(2) for setting in settings}
@@ -385,7 +387,7 @@ def resolve_levels(args, cpu_order, memory_bytes):
     if args.memory is None:
         # Keep each RAM limit strictly below Docker's reported capacity.
         max_mib = (memory_bytes - 1) // MIB
-        args.memory = list(range(1024, max_mib + 1, 1024))
+        args.memory = list(range(2048, max_mib + 1, 2048))
         if not args.memory and max_mib >= 256:
             args.memory = [max_mib // 256 * 256]
     unsupported = [m for m in args.memory if m * MIB >= memory_bytes]
